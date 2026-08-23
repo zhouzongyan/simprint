@@ -4,7 +4,10 @@
 
 use crate::core::error::Result;
 use crate::domain::environment::{EnvironmentStatus, KernelDetail};
+use std::fs;
+use std::path::{Path, PathBuf};
 use tauri::Manager;
+use uuid::Uuid;
 
 pub mod downloader;
 pub mod extension;
@@ -97,26 +100,32 @@ impl KernelService {
             if !kernel_dir.is_dir() {
                 return Err(format!("内核安装路径不是目录: {}", kernel_dir.display()).into());
             }
-            // 检查可执行文件是否存在
-            if !exe_path.exists() {
+            // 检查内核包是否包含启动所需的完整运行时文件。
+            if let Err(error) = utils::validate_kernel_package_layout(&kernel_dir) {
                 crate::log_warn!(
                     crate::core::logger::modules::KERNEL,
-                    "内核目录存在但未找到可执行文件，保留目录并停止启动: {}",
-                    kernel_dir.display()
+                    "内核目录不完整，将下载当前包替换: {} - {}",
+                    kernel_dir.display(),
+                    error
                 );
-                utils::emit_status(
-                    status_emitter.as_ref(),
+                let exe_path = download_and_replace_kernel(
+                    &app,
                     &env_uuid,
                     &install_dir_name,
-                    EnvironmentStatus::Error,
-                    Some("内核目录不完整"),
-                    None,
-                    None,
-                    None,
-                );
-                return Err(
-                    format!("内核目录不完整，已保留原目录: {}", kernel_dir.display()).into(),
-                );
+                    &base,
+                    &kernel_dir,
+                    &kernel_detail,
+                    status_emitter,
+                )
+                .await?;
+                record_ready_installation(
+                    &app,
+                    &kernel_id,
+                    &exe_path,
+                    kernel_detail.signature.as_deref().unwrap_or_default(),
+                )
+                .await;
+                return Ok(exe_path.to_string_lossy().to_string());
             } else {
                 // 校验 signature
                 let primary_signature = kernel_detail
@@ -143,8 +152,11 @@ impl KernelService {
                     &accepted_signatures,
                     status_emitter.clone(),
                 ) {
-                    Ok(Some(verified_signature)) => {
+                    Ok(Some(verified_signature))
+                        if is_current_kernel_signature(&verified_signature, primary_signature) =>
+                    {
                         // 校验通过
+                        // 只有当前包的主签名匹配时才复用已有目录。
                         utils::emit_status(
                             status_emitter.as_ref(),
                             &env_uuid,
@@ -159,27 +171,20 @@ impl KernelService {
                             .await;
                         return Ok(exe_path.to_string_lossy().to_string());
                     }
+                    Ok(Some(verified_signature)) => {
+                        crate::log_warn!(
+                            crate::core::logger::modules::KERNEL,
+                            "内核目录命中历史兼容签名，将下载当前包替换: {} - {}",
+                            kernel_dir.display(),
+                            verified_signature
+                        );
+                    }
                     Ok(None) => {
                         crate::log_warn!(
                             crate::core::logger::modules::KERNEL,
                             "内核校验失败，保留目录并停止启动: {}",
                             kernel_dir.display()
                         );
-                        utils::emit_status(
-                            status_emitter.as_ref(),
-                            &env_uuid,
-                            &install_dir_name,
-                            EnvironmentStatus::Error,
-                            Some("内核校验失败"),
-                            None,
-                            None,
-                            None,
-                        );
-                        return Err(format!(
-                            "内核校验失败，已保留原目录: {}",
-                            kernel_dir.display()
-                        )
-                        .into());
                     }
                     Err(e) => {
                         crate::log_warn!(
@@ -188,31 +193,36 @@ impl KernelService {
                             kernel_dir.display(),
                             e
                         );
-                        utils::emit_status(
-                            status_emitter.as_ref(),
-                            &env_uuid,
-                            &install_dir_name,
-                            EnvironmentStatus::Error,
-                            Some("内核校验出错"),
-                            None,
-                            None,
-                            None,
-                        );
-                        return Err(format!(
-                            "内核校验出错，已保留原目录 {}: {e}",
-                            kernel_dir.display()
-                        )
-                        .into());
                     }
                 }
+
+                let exe_path = download_and_replace_kernel(
+                    &app,
+                    &env_uuid,
+                    &install_dir_name,
+                    &base,
+                    &kernel_dir,
+                    &kernel_detail,
+                    status_emitter,
+                )
+                .await?;
+                record_ready_installation(
+                    &app,
+                    &kernel_id,
+                    &exe_path,
+                    kernel_detail.signature.as_deref().unwrap_or_default(),
+                )
+                .await;
+                return Ok(exe_path.to_string_lossy().to_string());
             }
         }
 
-        // 只有目录不存在时才下载；现有安装绝不在替代包准备好之前删除。
-        let exe_path = downloader::download_and_install_kernel(
+        // 目录不存在时也先下载到 staging，校验完整后再安装到正式目录。
+        let exe_path = download_and_replace_kernel(
             &app,
             &env_uuid,
             &install_dir_name,
+            &base,
             &kernel_dir,
             &kernel_detail,
             status_emitter,
@@ -319,5 +329,155 @@ impl KernelService {
         height: i32,
     ) -> Result<()> {
         runtime_bridge::set_window_bounds(env_uuid, x, y, width, height).await
+    }
+}
+
+async fn download_and_replace_kernel(
+    app: &tauri::AppHandle,
+    env_uuid: &Option<String>,
+    install_dir_name: &str,
+    base: &Path,
+    kernel_dir: &Path,
+    kernel_detail: &KernelDetail,
+    status_emitter: Option<KernelStatusEmitter>,
+) -> Result<PathBuf> {
+    let staging_name = format!(".{install_dir_name}.staging-{}", Uuid::new_v4());
+    let staging_dir = utils::resolve_kernel_install_dir(base, &staging_name)?;
+    downloader::download_and_install_kernel(
+        app,
+        env_uuid,
+        install_dir_name,
+        &staging_dir,
+        kernel_detail,
+        status_emitter,
+    )
+    .await
+    .map_err(|error| kernel_prepare_error(error, &staging_dir, kernel_dir))?;
+
+    let backup_dir = if kernel_dir.exists() {
+        let path = base.join(format!(".{install_dir_name}.backup-{}", Uuid::new_v4()));
+        if let Err(error) = fs::rename(kernel_dir, &path) {
+            let _ = fs::remove_dir_all(&staging_dir);
+            return Err(format!("替换旧内核前无法保留原目录: {error}").into());
+        }
+        Some(path)
+    } else {
+        None
+    };
+
+    if let Err(error) = fs::rename(&staging_dir, kernel_dir) {
+        if let Some(backup_dir) = &backup_dir {
+            let _ = fs::rename(backup_dir, kernel_dir);
+        }
+        let _ = fs::remove_dir_all(&staging_dir);
+        return Err(format!("安装新内核失败，已恢复原目录: {error}").into());
+    }
+
+    if let Some(backup_dir) = backup_dir {
+        if let Err(error) = fs::remove_dir_all(&backup_dir) {
+            crate::log_warn!(
+                crate::core::logger::modules::KERNEL,
+                "新内核已安装，但清理旧目录失败: {} - {}",
+                backup_dir.display(),
+                error
+            );
+        }
+    }
+
+    Ok(kernel_dir.join(utils::exe_name()))
+}
+
+fn kernel_prepare_error(
+    error: impl std::fmt::Display,
+    staging_dir: &Path,
+    kernel_dir: &Path,
+) -> crate::core::error::Error {
+    let _ = fs::remove_dir_all(staging_dir);
+    let staging_path = staging_dir.to_string_lossy();
+    let install_path = kernel_dir.to_string_lossy();
+    let mut detail = error.to_string().replace(staging_path.as_ref(), install_path.as_ref());
+    const ERROR_PREFIX: &str = "[080601] Kernel preparation failed: ";
+    const DETAIL_PREFIX: &str = "内核包准备失败：";
+    loop {
+        if let Some(stripped) = detail.strip_prefix(ERROR_PREFIX) {
+            detail = stripped.to_string();
+        } else if let Some(stripped) = detail.strip_prefix(DETAIL_PREFIX) {
+            detail = stripped.to_string();
+        } else {
+            break;
+        }
+    }
+    crate::core::error::Error::KernelPrepareFailed(detail)
+}
+
+fn is_current_kernel_signature(verified_signature: &str, primary_signature: &str) -> bool {
+    verified_signature.eq_ignore_ascii_case(primary_signature)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_current_kernel_signature, kernel_prepare_error};
+
+    #[test]
+    fn only_the_current_signature_reuses_an_existing_kernel() {
+        assert!(is_current_kernel_signature("ABC123", "abc123"));
+        assert!(!is_current_kernel_signature("old-compatible", "current"));
+    }
+
+    #[test]
+    fn staging_failure_reports_install_path_and_removes_temporary_directory() {
+        let base = std::env::temp_dir().join(format!(
+            "simprint-kernel-staging-error-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let staging_dir = base.join(".Chrome 144.staging-test");
+        let kernel_dir = base.join("Chrome 144");
+        std::fs::create_dir_all(&staging_dir).unwrap();
+
+        let error = kernel_prepare_error(
+            format!(
+                "内核包不完整：缺少 {}",
+                staging_dir.join("chrome_crashpad_handler.exe").display()
+            ),
+            &staging_dir,
+            &kernel_dir,
+        )
+        .to_string();
+
+        assert!(!staging_dir.exists());
+        assert!(error.contains(&kernel_dir.to_string_lossy().to_string()));
+        assert!(!error.contains(".Chrome 144.staging-test"));
+        assert_eq!(
+            error.matches("[080601] Kernel preparation failed:").count(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn staging_failure_does_not_duplicate_kernel_prepare_prefix() {
+        let base = std::env::temp_dir().join(format!(
+            "simprint-kernel-prefix-error-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let staging_dir = base.join(".Chrome 144.staging-test");
+        let kernel_dir = base.join("Chrome 144");
+        std::fs::create_dir_all(&staging_dir).unwrap();
+
+        let error = kernel_prepare_error(
+            crate::core::error::Error::KernelPrepareFailed(
+                "内核包不完整：缺少 simprint.exe".to_string(),
+            ),
+            &staging_dir,
+            &kernel_dir,
+        )
+        .to_string();
+
+        assert_eq!(
+            error.matches("[080601] Kernel preparation failed:").count(),
+            1
+        );
+        assert!(!error.contains("内核包准备失败："));
+        let _ = std::fs::remove_dir_all(base);
     }
 }

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::{fs, io::Write};
 
 use futures::future::try_join_all;
 use tauri::AppHandle;
@@ -374,6 +375,7 @@ async fn prepare_start_request(
 
     let user_data_dir =
         PathBuf::from(cache_path.trim()).join("browser").join("cache").join(&env_id);
+    ensure_browser_user_data_dir(&user_data_dir)?;
 
     if let Some(ctx) = AppContext::try_get() {
         ctx.env_status_manager
@@ -497,6 +499,42 @@ async fn prepare_start_request(
         window_size,
         extension_dirs,
     })
+}
+
+fn ensure_browser_user_data_dir(path: &std::path::Path) -> Result<()> {
+    fs::create_dir_all(path)
+        .map_err(|error| format!("无法创建浏览器用户数据目录 {}: {error}", path.display()))?;
+
+    let probe_path = path.join(".simprint-write-probe");
+    let probe_result = (|| -> std::io::Result<()> {
+        let mut file = fs::File::create(&probe_path)?;
+        file.write_all(b"simprint")?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    let _ = fs::remove_file(&probe_path);
+    probe_result.map_err(|error| {
+        format!(
+            "浏览器用户数据目录不可写 {}: {error}。请检查目录权限或更换缓存路径",
+            path.display()
+        )
+        .into()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_browser_user_data_dir;
+
+    #[test]
+    fn creates_and_validates_browser_user_data_dir() {
+        let path =
+            std::env::temp_dir().join(format!("simprint-user-data-{}", uuid::Uuid::new_v4()));
+        ensure_browser_user_data_dir(&path).unwrap();
+        assert!(path.is_dir());
+        assert!(!path.join(".simprint-write-probe").exists());
+        let _ = std::fs::remove_dir_all(path);
+    }
 }
 
 fn merge_local_extensions(

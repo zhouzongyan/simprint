@@ -6,6 +6,9 @@ publish = false
 license = "AGPL-3.0-only"
 autobins = false
 
+[features]
+development = []
+
 [lib]
 name = "runtime"
 path = "src/lib.rs"

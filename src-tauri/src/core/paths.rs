@@ -142,6 +142,8 @@ impl PathManager {
     pub fn get_profiles_dir(_app: &tauri::AppHandle) -> Result<PathBuf> {
         let dir = if let Some(value) = Self::read_store_storage_string("profilesPath") {
             Self::resolve_override_path(&value, &Self::get_root_dir()?)?
+        } else if let Some(workspace_root) = Self::find_workspace_root() {
+            workspace_root.join("data").join("profiles")
         } else {
             Self::get_data_dir()?.join("profiles")
         };
@@ -217,6 +219,18 @@ impl PathManager {
             .map(|value| Self::resolve_override_path(value, &root_dir))
             .transpose()?
             .unwrap_or_else(|| root_dir.join(default_child)))
+    }
+
+    fn find_workspace_root() -> Option<PathBuf> {
+        let current = std::env::current_dir().ok()?;
+        for candidate in current.ancestors() {
+            let package_manifest = candidate.join("package.json");
+            let tauri_manifest = candidate.join("src-tauri").join("Cargo.toml");
+            if package_manifest.is_file() && tauri_manifest.is_file() {
+                return Some(candidate.to_path_buf());
+            }
+        }
+        None
     }
 
     fn resolve_override_path(value: &str, base_dir: &Path) -> Result<PathBuf> {
@@ -357,5 +371,18 @@ impl BootstrapConfig {
             && self.cache_dir.is_none()
             && self.data_dir.is_none()
             && self.kernels_dir.is_none()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PathManager;
+
+    #[test]
+    fn finds_the_workspace_root_when_running_from_the_project() {
+        let root =
+            PathManager::find_workspace_root().expect("workspace root should be discoverable");
+        assert!(root.join("package.json").is_file());
+        assert!(root.join("src-tauri").join("Cargo.toml").is_file());
     }
 }

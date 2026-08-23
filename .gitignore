@@ -26,6 +26,9 @@ dist-ssr
 # Generated files
 src/core/plugin/loader/plugin-imports.generated.ts
 
+# Local runtime data
+/data/
+
 # tauri generated files
 src-tauri/target
 src-tauri/crates/*/target/

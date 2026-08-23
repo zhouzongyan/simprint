@@ -62,6 +62,8 @@ Simprint 想走另一条路线：构建一个开放、可编排、可编程的�
 
 ## Quick Start
 
+完整的 Windows 从零开发配置步骤见 [开发配置文档](./docs/development-setup.zh-CN.md)。
+
 ### Prerequisites
 
 - Node.js 20+

@@ -14,6 +14,9 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
+
+#[cfg(feature = "development")]
+const DEVELOPMENT_BROWSER_ARGS: [&str; 1] = ["--no-sandbox"];
 use tokio::process::Child;
 
 const BROWSER_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -147,22 +150,25 @@ pub async fn launch_browser(
         }
     };
 
-    let browser = match wait_for_browser_ready(&env_id, browser, &mut server_ready).await {
-        Ok(browser) => browser,
-        Err(error) => {
-            fail_launch(
-                &env_id,
-                "eventbus_handshake",
-                &error,
-                cdp_endpoint_manager.clone(),
-                job_manager.clone(),
-                status_manager.clone(),
-                events.clone(),
-            )
-            .await;
-            return Err(error);
-        }
-    };
+    let browser =
+        match wait_for_browser_ready(&env_id, browser, &mut server_ready, &request.user_data_dir)
+            .await
+        {
+            Ok(browser) => browser,
+            Err(error) => {
+                fail_launch(
+                    &env_id,
+                    "eventbus_handshake",
+                    &error,
+                    cdp_endpoint_manager.clone(),
+                    job_manager.clone(),
+                    status_manager.clone(),
+                    events.clone(),
+                )
+                .await;
+                return Err(error);
+            }
+        };
 
     let (mut browser, browser_ws_url) = match wait_for_cdp_ready(&env_id, cdp_port, browser).await {
         Ok(ready) => ready,
@@ -307,6 +313,7 @@ async fn wait_for_browser_ready(
     env_id: &str,
     mut browser: Child,
     server_ready: &mut tokio::sync::mpsc::Receiver<crate::infrastructure::eventbus::Result<()>>,
+    user_data_dir: &str,
 ) -> Result<Child> {
     let timeout = tokio::time::sleep(BROWSER_STARTUP_TIMEOUT);
     tokio::pin!(timeout);
@@ -328,9 +335,12 @@ async fn wait_for_browser_ready(
                     "failed waiting for browser process for environment {}: {}",
                     env_id, error
                 )))?;
+            let log_tail = read_browser_log_tail(user_data_dir);
             Err(RuntimeError::Internal(format!(
-                "browser process exited before handshake for environment {}: {}",
-                env_id, status
+                "browser process exited before handshake for environment {}: {}{}",
+                env_id,
+                status,
+                log_tail
             )))
         }
         _ = &mut timeout => {
@@ -355,6 +365,8 @@ async fn spawn_browser_process(
     extension_dirs: Option<&Vec<String>>,
     job_manager: Arc<JobManager>,
 ) -> Result<Child> {
+    validate_browser_runtime_layout(exe_path)?;
+
     let mut args = vec![
         format!("--simprint-env-id={}", env_id),
         format!("--user-data-dir={}", user_data_dir),
@@ -367,6 +379,9 @@ async fn spawn_browser_process(
     if cfg!(debug_assertions) {
         args.push("--v=1".to_string());
     }
+
+    #[cfg(feature = "development")]
+    args.extend(DEVELOPMENT_BROWSER_ARGS.iter().map(|arg| (*arg).to_string()));
 
     if let Some(id) = display_id {
         args.push(format!("--simprint-display-id={}", id));
@@ -440,7 +455,9 @@ async fn spawn_browser_process(
             .map_err(|error| RuntimeError::Internal(error.to_string()))?;
     }
 
-    let mut child = command.spawn().map_err(|error| RuntimeError::Internal(error.to_string()))?;
+    let mut child = command
+        .spawn()
+        .map_err(|error| RuntimeError::Internal(format_process_spawn_error(exe_path, error)))?;
     let pid = child.id().ok_or_else(|| {
         RuntimeError::Internal(format!(
             "browser process for environment {} has no pid",
@@ -462,6 +479,156 @@ async fn spawn_browser_process(
         ),
     );
     Ok(child)
+}
+
+fn validate_browser_runtime_layout(exe_path: &str) -> Result<()> {
+    let exe = Path::new(exe_path);
+    if !exe.is_file() {
+        return Err(RuntimeError::Internal(format!(
+            "浏览器内核路径无效：{}",
+            exe_path
+        )));
+    }
+
+    Ok(())
+}
+
+fn read_browser_log_tail(user_data_dir: &str) -> String {
+    let path = Path::new(user_data_dir).join("simprint-browser.log");
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return String::new();
+    };
+    let tail = content
+        .lines()
+        .rev()
+        .take(12)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join(" | ");
+    if tail.is_empty() {
+        String::new()
+    } else {
+        format!("；浏览器日志：{tail}")
+    }
+}
+
+fn format_process_spawn_error(exe_path: &str, error: std::io::Error) -> String {
+    if let Some(message) = windows_policy_error_message(error.raw_os_error()) {
+        return format!("{message}：{exe_path}");
+    }
+
+    format!("启动浏览器内核失败 {}：{}", exe_path, error)
+}
+
+fn windows_policy_error_message(code: Option<i32>) -> Option<&'static str> {
+    match code.map(|value| value as u32) {
+        Some(577) => Some("Windows 代码完整性拒绝了该内核或其 DLL（错误 577）"),
+        Some(1260) => Some("Windows 应用控制策略阻止了该内核（错误 1260）"),
+        Some(225) => Some("Windows Defender 阻止了该内核（错误 225）"),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::{
+        read_browser_log_tail, validate_browser_runtime_layout, windows_policy_error_message,
+    };
+
+    #[cfg(feature = "development")]
+    #[test]
+    fn development_launch_disables_chromium_sandbox_for_restricted_windows_hosts() {
+        assert!(super::DEVELOPMENT_BROWSER_ARGS
+            .iter()
+            .any(|arg| arg == "--no-sandbox"));
+    }
+
+    #[test]
+    fn maps_windows_policy_errors_to_actionable_messages() {
+        for (code, expected) in [
+            (577, "代码完整性"),
+            (1260, "应用控制策略"),
+            (225, "Defender"),
+        ] {
+            assert!(windows_policy_error_message(Some(code)).unwrap().contains(expected));
+        }
+        assert!(windows_policy_error_message(Some(2)).is_none());
+    }
+
+    #[test]
+    fn reads_only_the_tail_of_the_browser_log() {
+        let dir = std::env::temp_dir().join(format!(
+            "simprint-browser-log-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lines = (1..=15).map(|line| format!("line-{line}")).collect::<Vec<_>>();
+        std::fs::write(dir.join("simprint-browser.log"), lines.join("\n")).unwrap();
+
+        let tail = read_browser_log_tail(dir.to_str().unwrap());
+
+        assert!(tail.starts_with("；浏览器日志：line-4 | line-5"));
+        assert!(tail.ends_with("line-15"));
+        assert!(!tail.contains("line-3"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn missing_browser_log_does_not_add_noise() {
+        let dir = std::env::temp_dir().join(format!(
+            "simprint-browser-log-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        assert_eq!(read_browser_log_tail(dir.to_str().unwrap()), "");
+    }
+
+    #[test]
+    fn accepts_a_kernel_without_standalone_crashpad_handler() {
+        let dir = std::env::temp_dir().join(format!(
+            "simprint-kernel-layout-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("simprint.exe");
+        std::fs::write(&exe, b"test").unwrap();
+
+        let result = validate_browser_runtime_layout(exe.to_str().unwrap());
+
+        assert!(result.is_ok());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rejects_a_missing_browser_executable() {
+        let dir = std::env::temp_dir().join(format!(
+            "simprint-kernel-layout-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let exe = dir.join("simprint.exe");
+
+        let error = validate_browser_runtime_layout(exe.to_str().unwrap()).unwrap_err();
+
+        assert!(error.to_string().contains("浏览器内核路径无效"));
+    }
 }
 
 pub async fn stop_environment(

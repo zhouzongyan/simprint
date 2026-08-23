@@ -12,6 +12,8 @@ This repository is in an active open-source transition. We welcome bug reports, 
 
 ## Development Setup
 
+Windows 从零配置、桌面端启动和可选服务端联调请先阅读 [开发配置文档](./docs/development-setup.zh-CN.md)。
+
 ### Prerequisites
 
 - Node.js 20+
@@ -41,7 +43,7 @@ Many contributions do not require a local backend. Documentation updates, CI cha
 
 If your change touches server-backed flows, workspace resources, or API-dependent behavior, you may also need a self-hosted backend during development.
 
-The current bootstrap command for the self-hosted server is documented in [README.md](./README.md). After the server is available, update your local `src-tauri/config.development.toml` so `base_url` points to your development server.
+The desktop application currently handles its main business routes through the embedded SQLite business layer. Only features that explicitly use the standalone HTTP server need the server-side setup described in the development guide.
 
 ## Useful Commands
 

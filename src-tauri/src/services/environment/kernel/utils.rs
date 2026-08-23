@@ -69,6 +69,23 @@ pub fn exe_name() -> &'static str {
     return "simprint";
 }
 
+/// 校验内核目录是否包含启动所需的文件。
+///
+/// Windows 版本的 Simprint Chromium 会在主进程启动时拉起 Crashpad
+/// handler；只校验 chrome.dll 的哈希无法发现缺少该子进程的残缺安装包。
+/// 当前内核可将 Crashpad handler 集成在主程序中，因此这里只要求主程序存在。
+pub fn validate_kernel_package_layout(kernel_dir: &Path) -> Result<()> {
+    let required_files = [exe_name()];
+    for file_name in required_files {
+        let path = kernel_dir.join(file_name);
+        if !path.is_file() {
+            return Err(format!("内核包不完整：缺少 {}", path.display()).into());
+        }
+    }
+
+    Ok(())
+}
+
 /// 核心 DLL 文件名
 pub fn core_dll_name() -> &'static str {
     #[cfg(target_os = "windows")]
@@ -150,7 +167,7 @@ pub fn emit_status(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_kernel_install_dir;
+    use super::{exe_name, resolve_kernel_install_dir, validate_kernel_package_layout};
     use std::path::Path;
 
     #[test]
@@ -163,5 +180,39 @@ mod tests {
         assert!(resolve_kernel_install_dir(base, "").is_err());
         assert!(resolve_kernel_install_dir(base, "..").is_err());
         assert!(resolve_kernel_install_dir(base, "nested/kernel").is_err());
+    }
+
+    #[test]
+    fn rejects_kernel_without_browser_executable() {
+        let dir = std::env::temp_dir().join(format!(
+            "simprint-kernel-layout-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let result = validate_kernel_package_layout(&dir);
+        assert!(result.is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn accepts_kernel_without_standalone_crashpad_handler() {
+        let dir = std::env::temp_dir().join(format!(
+            "simprint-kernel-layout-valid-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(exe_name()), b"test").unwrap();
+
+        assert!(validate_kernel_package_layout(&dir).is_ok());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

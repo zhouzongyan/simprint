@@ -95,6 +95,20 @@ pub async fn download_and_install_kernel(
         return Err("解压后未找到可执行文件".into());
     }
 
+    super::utils::validate_kernel_package_layout(kernel_dir).map_err(|error| {
+        emit_status(
+            status_emitter.as_ref(),
+            env_uuid,
+            kernel_value,
+            EnvironmentStatus::Error,
+            Some("内核包不完整"),
+            None,
+            None,
+            None,
+        );
+        error
+    })?;
+
     // 校验核心 DLL 的 signature
     if let Some(ref sig) = kernel_detail.signature {
         verify_core_dll_signature(
